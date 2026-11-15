@@ -1,7 +1,7 @@
 """铜期货盘口采集器 API。
 
-- GET /book    已同步时返回序号 + 按价排序的买卖盘口；失步返回 503
-- GET /status  任意时刻可用：同步状态、序号、世代、统计计数
+- GET /book    已同步时返回序号 + 按价排序的买卖盘口；失步（含同序号内容冲突）返回 503
+- GET /status  任意时刻可用：同步状态、序号、世代、冲突序号、统计计数
 - GET /docs    Swagger UI 在线查看/调用
 """
 from __future__ import annotations
@@ -33,7 +33,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Copper Futures Order Book Collector",
     version="1.0.0",
-    description="单合约盘口重建：快照 + 连续增量衔接，失步返回 503，迟到快照自动丢弃。",
+    description="单合约盘口重建：快照 + 连续增量衔接，同序号内容冲突/失步返回 503，迟到快照自动丢弃。",
     lifespan=lifespan,
 )
 
@@ -50,7 +50,7 @@ async def index() -> dict:
 @app.get(
     "/book",
     summary="查询当前盘口",
-    responses={503: {"description": "失步：启动中、断流或发现缺号，盘口不可信"}},
+    responses={503: {"description": "失步：启动中、断流、缺号或同序号内容冲突，盘口不可信"}},
 )
 async def get_book():
     async with manager.lock:
@@ -59,7 +59,7 @@ async def get_book():
                 status_code=503,
                 content={
                     "error": "book_not_synchronized",
-                    "detail": "盘口未同步（启动/断流/缺号恢复中），暂不可信",
+                    "detail": "盘口未同步（启动/断流/缺号/序号内容冲突，恢复中），暂不可信",
                     "synced": False,
                     "last_error": manager.last_error,
                 },

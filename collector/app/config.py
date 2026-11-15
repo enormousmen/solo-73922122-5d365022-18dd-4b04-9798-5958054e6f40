@@ -16,3 +16,5 @@ class Settings:
     data_timeout: float = float(os.getenv("DATA_TIMEOUT", "5.0"))
     # 快照 HTTP 请求超时（需大于行情源可能注入的快照延迟）
     snapshot_timeout: float = float(os.getenv("SNAPSHOT_TIMEOUT", "30.0"))
+    # 每连接的增量去重窗口：记住最近多少条已收增量的 (序号, 内容) 用于冲突核对
+    dedup_window: int = int(os.getenv("DEDUP_WINDOW", "64"))

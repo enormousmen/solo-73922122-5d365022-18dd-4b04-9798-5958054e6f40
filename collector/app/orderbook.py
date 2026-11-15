@@ -6,9 +6,15 @@
 - 增量：{"type": "increment", "symbol": ..., "seq": N, "changes": [{"side", "price", "qty"}, ...]}
   seq 全市场连续递增；qty == 0 表示删除该价位；同一增量内的变更原子可见。
 - 每侧最多 max_levels 档，价量均为整数。
+
+去重约定：
+- 每个连接维护一个 DedupWindow，记住最近若干条已收到增量的 (seq, 变更内容)；
+- 同序号同内容 = 重发，恰好应用一次；同序号不同内容 = 冲突，抛 ConflictError；
+- 快照已覆盖但本连接未见过原帧的序号不在窗口内，只丢弃、不报冲突。
 """
 from __future__ import annotations
 
+from collections import OrderedDict
 from dataclasses import dataclass
 
 
@@ -24,6 +30,14 @@ class StaleSnapshotError(Exception):
     """迟到快照：发起于上一次连接世代，必须丢弃。"""
 
 
+class ConflictError(ProtocolError):
+    """同序号增量被重发成不同内容：数据不可信，必须整轮重同步。"""
+
+    def __init__(self, seq: int, detail: str = "") -> None:
+        self.seq = seq
+        super().__init__(detail or f"conflicting retransmission for seq {seq}")
+
+
 def _is_int(value: object) -> bool:
     # bool 是 int 的子类，但 True/False 不是合法的价量
     return isinstance(value, int) and not isinstance(value, bool)
@@ -34,6 +48,42 @@ class Change:
     side: str  # "bid" | "ask"
     price: int
     qty: int
+
+
+class DedupWindow:
+    """单个连接的去重窗口：记住最近 capacity 条已收到增量的 (seq -> 变更内容)。
+
+    check() 判定：
+    - "new"       未见过的序号（记录后返回）；
+    - "duplicate" 序号已见且内容一致 —— 正常重发，恰好应用一次，跳过；
+    - "conflict"  序号已见但内容不同 —— 同序号被重发成不同档位，不可信。
+
+    只记录本连接真实收到的帧；超出容量的最旧条目按到达顺序淘汰。
+    被淘汰（或快照已覆盖但原帧未见）的序号再来时只能按 "new" 重新记录，
+    不会据此误报冲突。
+    """
+
+    def __init__(self, capacity: int = 64) -> None:
+        if capacity <= 0:
+            raise ValueError("capacity must be positive")
+        self.capacity = capacity
+        self._seen: OrderedDict[int, tuple[Change, ...]] = OrderedDict()
+
+    def __len__(self) -> int:
+        return len(self._seen)
+
+    def __contains__(self, seq: object) -> bool:
+        return seq in self._seen
+
+    def check(self, seq: int, changes: list[Change]) -> str:
+        content = tuple(changes)
+        seen = self._seen.get(seq)
+        if seen is not None:
+            return "duplicate" if seen == content else "conflict"
+        self._seen[seq] = content
+        while len(self._seen) > self.capacity:
+            self._seen.popitem(last=False)
+        return "new"
 
 
 class OrderBook:
@@ -147,10 +197,14 @@ def build_synced_book(
     buffered: list[object],
     symbol: str,
     max_levels: int = 20,
+    dedup: DedupWindow | None = None,
 ) -> tuple[OrderBook, int, int]:
     """用快照 + 缓冲增量构建已同步订单簿。
 
-    - 序号 <= 快照序号的缓冲增量（含重复）丢弃；
+    - 每条缓冲增量先经 dedup 窗口核对（与实时处理共用同一窗口）：
+      同序号同内容为正常重发；同序号不同内容抛 ConflictError；
+    - 序号 <= 快照序号的缓冲增量（含重复）丢弃 —— 快照已覆盖而本连接
+      未见过原帧的序号不在窗口内，只丢弃、不报冲突；
     - 之后的增量必须从 snapshot.seq + 1 开始逐条连续，恰好应用一次；
     - 任一环节缺号即抛 GapError，由上层触发整轮重同步。
 
@@ -165,6 +219,8 @@ def build_synced_book(
     dropped = 0
     for msg in buffered:
         seq, changes = validate_increment(msg, symbol)
+        if dedup is not None and dedup.check(seq, changes) == "conflict":
+            raise ConflictError(seq)
         if seq <= last:
             dropped += 1  # 快照已覆盖或重复投递，跳过保证“恰好应用一次”
             continue

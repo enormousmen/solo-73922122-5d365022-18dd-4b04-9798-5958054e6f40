@@ -21,6 +21,7 @@ services:
       RECONNECT_DELAY: "1.0"
       DATA_TIMEOUT: "5.0"
       SNAPSHOT_TIMEOUT: "30.0"
+      DEDUP_WINDOW: "64"
     ports:
       - "8001:8000"   # 采集器：/book、/status、/docs
     depends_on:

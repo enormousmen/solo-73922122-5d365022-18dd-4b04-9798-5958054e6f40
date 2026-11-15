@@ -1,16 +1,17 @@
 #!/usr/bin/env python3
-"""端到端冒烟测试：验证盘口重建在丢序/断线/延迟快照下的行为。
+"""端到端冒烟测试：验证盘口重建在丢序/断线/延迟快照/冲突重放下的行为。
 
 用法：
     python3 scripts/smoke_test.py [--collector http://localhost:8001] [--source http://localhost:8000]
 
 覆盖：
 1. 启动后自动同步，/book 返回序号 + 排序盘口；
-2. 重复增量恰好应用一次；
-3. 丢序 -> /book 变 503 -> 自动重同步恢复；
-4. 断线 -> 503 -> 自动恢复；
-5. 延迟快照 + 断线 -> 恢复期间 503，最终恢复且序号不回退；
-6. 全程序号单调不回退，盘口结构合法（整数价量、每侧 <=20 档、买卖不交叉）。
+2. 重复增量（同序号同内容）恰好应用一次；
+3. 冲突重放（同序号不同内容）-> /book 变 503、/status 标出冲突序号 -> 自动重同步恢复；
+4. 丢序 -> /book 变 503 -> 自动重同步恢复；
+5. 断线 -> 503 -> 自动恢复；
+6. 延迟快照 + 断线 -> 恢复期间 503，最终恢复且序号不回退；
+7. 全程序号单调不回退，盘口结构合法（整数价量、每侧 <=20 档、买卖不交叉）。
 """
 from __future__ import annotations
 
@@ -99,24 +100,41 @@ def main() -> int:
     check("重复被去重", stats1["duplicates_skipped"] > stats0["duplicates_skipped"],
           f"duplicates_skipped {stats0['duplicates_skipped']} -> {stats1['duplicates_skipped']}")
     check("重复后仍可用", col.get("/book").status_code == 200)
+    check("正常重传不误报冲突", stats1["conflicts"] == stats0["conflicts"])
 
-    print("== 3. 丢序 -> 503 -> 自动恢复 ==")
+    print("== 3. 冲突重放（同序号不同内容） -> 503 + 标出冲突序号 -> 自动恢复 ==")
+    r = src.post("/control/conflict")
+    check("冲突注入成功", r.json().get("ok", False), r.text)
+    conflict_seq = r.json().get("conflict_seq")
+    check("冲突后进入失步", wait_unsynced(col, 10))
+    r = col.get("/book")
+    check("冲突后 /book 返回 503", r.status_code == 503, f"got {r.status_code}")
+    st = col.get("/status").json()
+    check("/status 标出冲突序号", conflict_seq in st.get("conflict_seqs", []),
+          f"seq={conflict_seq} conflict_seqs={st.get('conflict_seqs')}")
+    check("冲突被计数", st["stats"]["conflicts"] > stats1["conflicts"],
+          f"conflicts {stats1['conflicts']} -> {st['stats']['conflicts']}")
+    check("冲突后自动重同步", wait_synced(col, 30))
+    check_book_shape(col.get("/book").json())
+    stats2 = col.get("/status").json()["stats"]
+
+    print("== 4. 丢序 -> 503 -> 自动恢复 ==")
     src.post("/control/gap", params={"count": 1})
     check("缺号后进入失步", wait_unsynced(col, 10))
     r = col.get("/book")
     check("失步时 /book 返回 503", r.status_code == 503, f"got {r.status_code}")
     check("丢序后自动重同步", wait_synced(col, 30))
     check_book_shape(col.get("/book").json())
-    stats2 = col.get("/status").json()["stats"]
-    check("缺号被计数", stats2["gaps"] > stats1["gaps"])
+    stats3 = col.get("/status").json()["stats"]
+    check("缺号被计数", stats3["gaps"] > stats2["gaps"])
 
-    print("== 4. 断线 -> 503 -> 自动恢复 ==")
+    print("== 5. 断线 -> 503 -> 自动恢复 ==")
     src.post("/control/disconnect")
     check("断线后进入失步", wait_unsynced(col, 10))
     check("断线后自动重同步", wait_synced(col, 30))
     check_book_shape(col.get("/book").json())
 
-    print("== 5. 延迟快照 + 断线（迟到快照不得覆盖新盘口） ==")
+    print("== 6. 延迟快照 + 断线（迟到快照不得覆盖新盘口） ==")
     src.post("/control/snapshot_delay", params={"seconds": 4})
     src.post("/control/disconnect")
     check("延迟快照期间进入失步", wait_unsynced(col, 10))
@@ -131,7 +149,7 @@ def main() -> int:
     st = col.get("/status").json()
     print(f"     stats: {st['stats']}")
 
-    print("== 6. 连续观察 5 秒 ==")
+    print("== 7. 连续观察 5 秒 ==")
     end = time.monotonic() + 5
     while time.monotonic() < end:
         r = col.get("/book")

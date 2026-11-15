@@ -2,7 +2,8 @@
 
 - GET  /snapshot   全量快照：序号 + 完整买卖盘（可用 ?delay= 或控制面设置延迟）
 - WS   /ws         增量流：连续序号、多档变更、qty=0 删档；另有周期心跳
-- POST /control/*  故障注入：延迟快照、制造丢序、断线、重放重复增量、暂停推送
+- POST /control/*  故障注入：延迟快照、制造丢序、断线、重放重复增量、
+                   冲突重放（同序号不同内容）、暂停推送
 """
 from __future__ import annotations
 
@@ -38,6 +39,7 @@ class MarketSource:
         self.tick_interval = 0.5       # 增量推送间隔（秒）
         self.paused_until = 0.0        # 暂停推送直到该 monotonic 时刻
         self.last_increment: dict | None = None
+        self.conflicts_injected = 0    # 已注入的冲突重放次数
         self._seed()
 
     def _seed(self) -> None:
@@ -128,7 +130,7 @@ async def lifespan(app: FastAPI):
 app = FastAPI(
     title="Local Copper Market Source",
     version="1.0.0",
-    description="本地行情源：快照 + 连续增量，支持延迟快照/丢序/断线等故障注入。",
+    description="本地行情源：快照 + 连续增量，支持延迟快照/丢序/断线/重复/冲突重放等故障注入。",
     lifespan=lifespan,
 )
 
@@ -181,6 +183,7 @@ async def get_status() -> dict:
         "pending_gap": source.pending_gap,
         "tick_interval": source.tick_interval,
         "paused": time.monotonic() < source.paused_until,
+        "conflicts_injected": source.conflicts_injected,
     }
 
 
@@ -215,6 +218,26 @@ async def control_duplicate() -> dict:
         return {"ok": False, "reason": "no increment sent yet"}
     await broadcast(source.last_increment)
     return {"ok": True, "resent_seq": source.last_increment["seq"]}
+
+
+@app.post("/control/conflict", summary="冲突重放：同序号不同内容重发上一条增量（测试采集器冲突检测）")
+async def control_conflict() -> dict:
+    if source.last_increment is None:
+        return {"ok": False, "reason": "no increment sent yet"}
+    orig = source.last_increment
+    changes = [dict(c) for c in orig["changes"]]  # 深拷贝，不污染正常重传用的原帧
+    # 保证内容不同：首条变更改量（原为删档 qty=0 则改为新增 2）
+    first = changes[0]
+    first["qty"] = first["qty"] + 1 if first["qty"] > 0 else 2
+    mutated = {
+        "type": "increment",
+        "symbol": orig["symbol"],
+        "seq": orig["seq"],
+        "changes": changes,
+    }
+    source.conflicts_injected += 1
+    await broadcast(mutated)  # 仅重发，不改源站自身盘口
+    return {"ok": True, "conflict_seq": orig["seq"], "changes": changes}
 
 
 @app.post("/control/pause", summary="暂停推送增量 seconds 秒（心跳继续）")

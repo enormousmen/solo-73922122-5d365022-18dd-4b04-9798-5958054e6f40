@@ -3,6 +3,8 @@ import pytest
 
 from app.orderbook import (
     Change,
+    ConflictError,
+    DedupWindow,
     GapError,
     OrderBook,
     ProtocolError,
@@ -111,6 +113,81 @@ def test_build_gap_raises():
 def test_build_empty_buffer_ok():
     book, applied, dropped = build_synced_book(snap(7, [[1, 1]], []), [], SYMBOL)
     assert book.seq == 7 and (applied, dropped) == (0, 0)
+
+
+# ---------- DedupWindow：每连接的去重窗口 ----------
+
+def test_dedup_window_verdicts():
+    w = DedupWindow(capacity=3)
+    assert w.check(1, [Change("bid", 100, 5)]) == "new"
+    assert w.check(1, [Change("bid", 100, 5)]) == "duplicate"   # 同序号同内容
+    assert w.check(1, [Change("bid", 100, 6)]) == "conflict"    # 同序号不同内容
+    assert w.check(1, [Change("ask", 100, 5)]) == "conflict"    # 方向不同也算冲突
+    assert w.check(2, [Change("bid", 100, 5)]) == "new"         # 不同序号互不影响
+
+
+def test_dedup_window_evicts_oldest():
+    w = DedupWindow(capacity=2)
+    w.check(1, [Change("bid", 100, 5)])
+    w.check(2, [Change("bid", 101, 5)])
+    w.check(3, [Change("bid", 102, 5)])   # 容量 2，淘汰最旧的 seq 1
+    assert 1 not in w and len(w) == 2
+    # 被淘汰后无法核对：同序号不同内容只能按新帧重新记录，不报冲突
+    assert w.check(1, [Change("bid", 100, 9)]) == "new"
+
+
+def test_dedup_window_multi_change_content():
+    w = DedupWindow()
+    frame = [Change("bid", 100, 5), Change("ask", 200, 0)]
+    assert w.check(7, frame) == "new"
+    assert w.check(7, [Change("bid", 100, 5), Change("ask", 200, 0)]) == "duplicate"
+    assert w.check(7, [Change("bid", 100, 5)]) == "conflict"    # 变更条数不同
+
+
+# ---------- 快照衔接 + 去重窗口（在途缓冲与实时处理共用核对） ----------
+
+def test_build_duplicate_in_buffer_with_dedup():
+    snapshot = snap(10, [[100, 1]], [])
+    dedup = DedupWindow()
+    buffered = [inc(11, [chg("bid", 100, 7)]), inc(11, [chg("bid", 100, 7)])]
+    book, applied, dropped = build_synced_book(snapshot, buffered, SYMBOL, dedup=dedup)
+    assert book.bids == {100: 7} and book.seq == 11
+    assert (applied, dropped) == (1, 1)   # 相同内容恰好应用一次
+
+
+def test_build_conflict_in_buffer_raises():
+    snapshot = snap(10, [[100, 1]], [])
+    buffered = [inc(11, [chg("bid", 100, 7)]), inc(11, [chg("bid", 100, 8)])]
+    with pytest.raises(ConflictError) as exc_info:
+        build_synced_book(snapshot, buffered, SYMBOL, dedup=DedupWindow())
+    assert exc_info.value.seq == 11
+
+
+def test_build_conflict_below_snapshot_seq_raises():
+    # 两条都在快照覆盖范围内，但都是本连接实收的帧：后到帧与原帧内容冲突
+    snapshot = snap(10, [[100, 1]], [])
+    buffered = [inc(9, [chg("bid", 100, 7)]), inc(9, [chg("bid", 100, 8)])]
+    with pytest.raises(ConflictError) as exc_info:
+        build_synced_book(snapshot, buffered, SYMBOL, dedup=DedupWindow())
+    assert exc_info.value.seq == 9
+
+
+def test_build_covered_unseen_seq_not_conflict():
+    # 快照已覆盖、本连接未见过原帧的序号：只丢弃，不报冲突
+    snapshot = snap(10, [[100, 1]], [])
+    dedup = DedupWindow()
+    buffered = [inc(9, [chg("bid", 100, 7)])]
+    book, applied, dropped = build_synced_book(snapshot, buffered, SYMBOL, dedup=dedup)
+    assert book.seq == 10 and book.bids == {100: 1}
+    assert (applied, dropped) == (0, 1)
+
+
+def test_build_without_dedup_keeps_old_behavior():
+    # 不传窗口：同序号不同内容仍按重复丢弃（兼容纯衔接逻辑调用方）
+    snapshot = snap(10, [[100, 1]], [])
+    buffered = [inc(11, [chg("bid", 100, 7)]), inc(11, [chg("bid", 100, 8)])]
+    book, applied, dropped = build_synced_book(snapshot, buffered, SYMBOL)
+    assert book.bids == {100: 7} and (applied, dropped) == (1, 1)
 
 
 # ---------- 协议校验 ----------

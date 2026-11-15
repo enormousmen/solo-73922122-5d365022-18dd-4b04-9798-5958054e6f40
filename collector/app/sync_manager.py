@@ -1,23 +1,31 @@
-"""同步管理器：WS 接收 + 快照衔接 + 断线/丢序自愈。
+"""同步管理器：WS 接收 + 快照衔接 + 断线/丢序/冲突自愈。
 
 状态机：
-- 启动 / 断流 / 发现缺号 -> synced=False（查询返回 503），进入新一轮恢复；
+- 启动 / 断流 / 发现缺号 / 发现同序号内容冲突 -> synced=False（查询返回 503），
+  进入新一轮恢复；
 - 每轮恢复：先连 WS 缓冲增量，同时取快照；快照返回后用缓冲中
   seq > snapshot.seq 的增量连续补齐（恰好一次），全部衔接才 synced=True；
-- 每次重连递增 generation，重连前发起的迟到快照响应一律丢弃，
-  不得恢复可用状态或覆盖新盘口。
+- 增量去重：每个连接一个 DedupWindow（默认最近 64 条已收增量的序号+内容），
+  快照在途缓冲与实时处理共用同一窗口核对；同序号同内容只应用一次，
+  同序号不同内容立即判冲突（ConflictError），/status 标出冲突序号；
+  快照已覆盖但本连接未见过原帧的序号只丢弃、不报冲突；
+- 每次重连递增 generation 并重建去重窗口，重连前发起的迟到快照响应一律丢弃，
+  旧连接的帧不得影响新轮次，迟到快照不得恢复可用状态或覆盖新盘口。
 """
 from __future__ import annotations
 
 import asyncio
 import json
 import logging
+from collections import deque
 
 import httpx
 import websockets
 
 from .config import Settings
 from .orderbook import (
+    ConflictError,
+    DedupWindow,
     GapError,
     OrderBook,
     ProtocolError,
@@ -39,9 +47,11 @@ class SyncManager:
         self.generation = 0  # 连接世代号，每轮恢复 +1
         self.lock = asyncio.Lock()  # 保护 book/synced，读写两侧都走它
         self.last_error: str | None = None
+        self.conflict_seqs: deque[int] = deque(maxlen=16)  # 最近检测到的冲突序号
         self.stats: dict[str, int] = {
             "increments_applied": 0,
             "duplicates_skipped": 0,
+            "conflicts": 0,
             "snapshots_applied": 0,
             "stale_snapshots": 0,
             "buffered_applied": 0,
@@ -49,6 +59,7 @@ class SyncManager:
             "gaps": 0,
             "resyncs": 0,
         }
+        self._window = DedupWindow(settings.dedup_window)  # 每连接去重窗口，_run 每轮重建
         self._task: asyncio.Task | None = None
         self._http: httpx.AsyncClient | None = None
 
@@ -77,13 +88,15 @@ class SyncManager:
         while True:
             self.generation += 1
             gen = self.generation
+            # 每轮恢复（= 每个新连接）重建去重窗口：旧连接的帧不影响新轮次
+            self._window = DedupWindow(self.settings.dedup_window)
             async with self.lock:
                 self.synced = False
             try:
                 await self._cycle(gen)
             except asyncio.CancelledError:
                 raise
-            except Exception as exc:  # 断线/缺号/协议错误/HTTP 错误都走重同步
+            except Exception as exc:  # 断线/缺号/冲突/协议错误/HTTP 错误都走重同步
                 self.last_error = f"{type(exc).__name__}: {exc}"
                 self.stats["resyncs"] += 1
                 log.warning("sync cycle failed (gen=%d): %s", gen, self.last_error)
@@ -180,9 +193,17 @@ class SyncManager:
         return data
 
     async def _install_snapshot(self, snapshot: dict, buffered: list[dict], gen: int) -> None:
-        book, applied, dropped = build_synced_book(
-            snapshot, buffered, symbol=self.settings.symbol, max_levels=self.settings.max_levels
-        )
+        try:
+            book, applied, dropped = build_synced_book(
+                snapshot,
+                buffered,
+                symbol=self.settings.symbol,
+                max_levels=self.settings.max_levels,
+                dedup=self._window,  # 快照在途缓冲与实时处理共用同一去重窗口
+            )
+        except ConflictError as exc:
+            self._note_conflict(exc.seq)
+            raise
         async with self.lock:
             if gen != self.generation:
                 # 双重保险：安装前再核一次世代，迟到快照绝不覆盖新盘口
@@ -200,6 +221,11 @@ class SyncManager:
 
     # ---------- 增量 ----------
 
+    def _note_conflict(self, seq: int) -> None:
+        self.stats["conflicts"] += 1
+        self.conflict_seqs.append(seq)
+        log.error("increment conflict at seq=%d: same seq re-sent with different content", seq)
+
     async def _apply_increment(self, msg: dict) -> None:
         seq, changes = validate_increment(msg, self.settings.symbol)
         async with self.lock:
@@ -207,11 +233,16 @@ class SyncManager:
                 raise ProtocolError("increment received while unsynced")
             last = self.book.seq
             if seq <= last:
+                # 重发帧：与本连接已收内容一致才算重复；同序号不同内容即冲突
+                if self._window.check(seq, changes) == "conflict":
+                    self._note_conflict(seq)
+                    raise ConflictError(seq)
                 self.stats["duplicates_skipped"] += 1
                 return  # 重复投递：恰好应用一次
             if seq != last + 1:
                 self.stats["gaps"] += 1
                 raise GapError(f"increment gap: expected seq {last + 1}, got {seq}")
+            self._window.check(seq, changes)  # 记录新帧内容，供后续重发核对
             self.book.apply_increment(seq, changes)
             self.stats["increments_applied"] += 1
 
@@ -226,6 +257,7 @@ class SyncManager:
             "generation": self.generation,
             "levels": {"bids": len(self.book.bids), "asks": len(self.book.asks)},
             "last_error": self.last_error,
+            "conflict_seqs": list(self.conflict_seqs),
             "stats": dict(self.stats),
             "source": {"http": s.source_http, "ws": s.source_ws},
             "config": {
@@ -233,5 +265,6 @@ class SyncManager:
                 "reconnect_delay": s.reconnect_delay,
                 "data_timeout": s.data_timeout,
                 "snapshot_timeout": s.snapshot_timeout,
+                "dedup_window": s.dedup_window,
             },
         }
